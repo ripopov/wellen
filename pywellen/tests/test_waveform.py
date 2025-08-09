@@ -292,3 +292,141 @@ def test_scope_types():
             expected_full_name = f"main.{scope_name}"
             actual_full_name = scope.full_name(h)
             assert actual_full_name == expected_full_name, f"Expected full name '{expected_full_name}', got '{actual_full_name}'"
+
+
+def test_query_signal():
+    """Test the new query_signal function with specific test cases"""
+    filename = _git_root_rel("wellen/inputs/specs/tracefile.vcd")
+    waves = Waveform(path=filename)
+    h = waves.hierarchy
+    
+    # Load the specific signal: SystemC.ROOT/PROBE1.abs
+    signal = waves.get_signal_from_path("SystemC.ROOT/PROBE1.abs")
+
+    # Note: Times are in fs (femtoseconds) as per the VCD timescale
+    test_cases = [
+        {
+            "query_time": 0,  # 0 fs (start of simulation)
+            "expected_value": 0.0,
+            "expected_actual_time": 0,
+            "expected_next_time": 500000,
+        },
+        {
+            "query_time": 500000,  # 500000 fs
+            "expected_value": 0.8660254037844387,
+            "expected_actual_time": 500000,
+            "expected_next_time": 527038,  # Next change is at 527038
+        },
+        {
+            "query_time": 1300000,  # 1300000 fs
+            "expected_value": 0.6166337461107539,
+            "expected_actual_time": 1230026,
+            "expected_next_time": 1500000,
+        },
+        {
+            "query_time": 2878938,  # 2878938 fs (last change, exact match)
+            "expected_value": 0.0,
+            "expected_actual_time": 2878938,
+            "expected_next_time": None,  # No more changes after this
+        },
+    ]
+    
+    for test_case in test_cases:
+        query_time = test_case["query_time"]
+        result = signal.query_signal(query_time)
+        
+        # Check value (for real values, use approximate comparison)
+        if test_case["expected_value"] is None:
+            assert result.value is None, f"At {query_time}: expected value None, got {result.value}"
+        else:
+            assert abs(result.value - test_case["expected_value"]) < 1e-10, \
+                f"At {query_time}: expected value {test_case['expected_value']}, got {result.value}"
+        
+        # Check actual_time
+        assert result.actual_time == test_case["expected_actual_time"], \
+            f"At {query_time}: expected actual_time {test_case['expected_actual_time']}, got {result.actual_time}"
+        
+        # Check next_time
+        assert result.next_time == test_case["expected_next_time"], \
+            f"At {query_time}: expected next_time {test_case['expected_next_time']}, got {result.next_time}"
+        
+        # Also verify that next_idx is set when next_time is set
+        if test_case["expected_next_time"] is not None:
+            assert result.next_idx is not None, \
+                f"At {query_time}: expected next_idx to be set when next_time is {test_case['expected_next_time']}"
+    
+    # Additional test: query before any changes
+    result = signal.query_signal(100)  # 100 fs (before first change at 500000)
+    assert result.value == 0.0, f"Expected initial value 0.0, got {result.value}"
+    assert result.actual_time == 0, f"Expected actual_time 0, got {result.actual_time}"
+    assert result.next_time == 500000, f"Expected next_time 500000, got {result.next_time}"
+
+
+def test_all_changes_after():
+    """Test the all_changes_after method that returns iterator for changes after given timestamp"""
+    filename = _git_root_rel("wellen/inputs/specs/tracefile.vcd")
+    waves = Waveform(path=filename)
+    h = waves.hierarchy
+    
+    # Load the specific signal: SystemC.ROOT/PROBE1.abs
+    signal = waves.get_signal_from_path("SystemC.ROOT/PROBE1.abs")
+    
+    # Get all changes after 1400ps (1400000 fs)
+    start_time = 1400000  # 1400 ps in femtoseconds
+    
+    # Count changes after start_time
+    changes_after = list(signal.all_changes_after(start_time))
+    num_changes_after = len(changes_after)
+    
+    print(f"\nChanges after {start_time} fs:")
+    print(f"  Number of changes: {num_changes_after}")
+    
+    # Show first few changes for verification
+    if changes_after:
+        print(f"  First change: time={changes_after[0][0]}, value={changes_after[0][1]}")
+        if len(changes_after) > 1:
+            print(f"  Second change: time={changes_after[1][0]}, value={changes_after[1][1]}")
+        print(f"  Last change: time={changes_after[-1][0]}, value={changes_after[-1][1]}")
+    
+    # Verify the first change is actually after start_time
+    if changes_after:
+        assert changes_after[0][0] > start_time, \
+            f"First change at {changes_after[0][0]} should be after {start_time}"
+    
+    # Compare with counting using all_changes()
+    all_changes = list(signal.all_changes())
+    changes_after_manual = [c for c in all_changes if c[0] > start_time]
+    num_changes_manual = len(changes_after_manual)
+    
+    assert num_changes_after == num_changes_manual, \
+        f"all_changes_after returned {num_changes_after} changes, but manual count is {num_changes_manual}"
+    
+    # Verify the changes match exactly
+    for i, (auto, manual) in enumerate(zip(changes_after, changes_after_manual)):
+        assert auto[0] == manual[0], f"Change {i}: time mismatch {auto[0]} vs {manual[0]}"
+        assert abs(auto[1] - manual[1]) < 1e-10, f"Change {i}: value mismatch {auto[1]} vs {manual[1]}"
+    
+    print(f"  Verification passed: all_changes_after matches manual filtering")
+    
+    # Test edge cases
+    # 1. Start time at exact change time
+    exact_change_time = 1500000  # This is one of the change times
+    changes_at_exact = list(signal.all_changes_after(exact_change_time))
+    if changes_at_exact:
+        assert changes_at_exact[0][0] > exact_change_time, \
+            f"When start_time is exact change time, should start from next change"
+    
+    # 2. Start time after all changes
+    very_late_time = 10000000000  # Very large time
+    changes_very_late = list(signal.all_changes_after(very_late_time))
+    assert len(changes_very_late) == 0, \
+        f"Expected no changes after {very_late_time}, but got {len(changes_very_late)}"
+    
+    # 3. Start time before any changes (should get all changes)
+    very_early_time = 0
+    changes_very_early = list(signal.all_changes_after(very_early_time))
+    # Should have fewer changes than all_changes since we want strictly after 0
+    assert len(changes_very_early) < len(all_changes) or len(changes_very_early) == len(all_changes) - 1, \
+        f"Changes after 0 should be less than or equal to total changes minus initial"
+    
+    print("  Edge case tests passed")

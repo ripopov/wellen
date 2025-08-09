@@ -7,8 +7,8 @@ use pyo3::types::PyInt;
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
 use wellen::{
-    viewers::{self},
-    LoadOptions, ScopeType, SignalValue, TimeTableIdx,
+    viewers::{self, ReadBodyContinuation},
+    LoadOptions, ScopeType, SignalRef, SignalValue, TimeTableIdx,
 };
 
 pub trait PyErrExt<T> {
@@ -31,6 +31,7 @@ fn pywellen(_py: Python, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Hierarchy>()?;
     m.add_class::<Timescale>()?;
     m.add_class::<TimescaleUnit>()?;
+    m.add_class::<QueryResult>()?;
     Ok(())
 }
 
@@ -231,7 +232,22 @@ impl Var {
     pub fn is_1bit(&self) -> bool {
         self.0.is_1bit()
     }
+    
+    /// Get the signal reference as an integer for internal use
+    /// Two vars with the same signal_ref() are aliases
+    pub fn signal_ref(&self) -> usize {
+        self.0.signal_ref().index()
+    }
 }
+
+// NOTE: Var equality and hashing are not implemented because:
+// 1. Multiple Var objects can legitimately reference the same signal (aliasing)
+// 2. Each iteration through the hierarchy creates new Var Python objects
+// 3. We cannot reliably compare Var structs by their internal fields
+// 
+// Instead, use:
+// - signal_ref() to check if two Vars reference the same signal (var1.signal_ref() == var2.signal_ref())
+// - full_name() to get a unique identifier for a Var
 
 #[pyclass]
 struct VarIter(Box<dyn Iterator<Item = Var> + Send + Sync>);
@@ -318,6 +334,24 @@ fn convert_py_idx(idx: isize, len: usize) -> usize {
     }
 }
 
+/// Convert a signal value to a Python object
+fn convert_signal_value_to_py<'a>(signal: SignalValue, py: Python<'a>) -> PyResult<Py<PyAny>> {
+    match signal {
+        SignalValue::Real(inner) => Ok(inner.into_pyobject(py).unwrap().into()),
+        SignalValue::String(str) => Ok(str.into_pyobject(py).unwrap().into()),
+        _ => match BigUint::try_from_signal(signal) {
+            // If this signal is 2bits, this function will return an int
+            Some(number) => Ok(number.into_pyobject(py).unwrap().into()),
+            // if this signal is not 2bits (e.g. it contains z,x, etc) then this function
+            // will return a string
+            None => signal
+                .to_bit_string()
+                .map(|val| val.into_pyobject(py).unwrap().into())
+                .ok_or_else(|| PyRuntimeError::new_err("Failed to convert signal value")),
+        },
+    }
+}
+
 #[pymethods]
 impl TimeTable {
     fn __getitem__<'a>(&self, idx: isize, py: Python<'a>) -> PyResult<Option<Bound<'a, PyInt>>> {
@@ -329,6 +363,10 @@ impl TimeTable {
             .cloned()
             .map(|val| val.into_pyobject(py).unwrap()))
     }
+
+    fn __len__(&self) -> usize {
+        self.0.len()
+    }
 }
 
 #[pyclass]
@@ -336,9 +374,11 @@ struct Waveform {
     #[pyo3(get)]
     hierarchy: Hierarchy,
 
-    wave_source: wellen::SignalSource,
-    #[pyo3(get)]
-    time_table: TimeTable,
+    wave_source: Option<wellen::SignalSource>,
+    time_table: Option<TimeTable>,
+    
+    // Store info for lazy body loading
+    body_continuation: Option<Box<ReadBodyContinuation<std::io::BufReader<std::fs::File>>>>,
 }
 
 #[pymethods]
@@ -346,11 +386,12 @@ struct Waveform {
 /// The "egress" point from which all users can read waveforms
 impl Waveform {
     #[new]
-    #[pyo3(signature = (path, multi_threaded = true, remove_scopes_with_empty_name = false))]
+    #[pyo3(signature = (path, multi_threaded = true, remove_scopes_with_empty_name = false, load_body = true))]
     fn new(
         path: String,
         multi_threaded: bool,
         remove_scopes_with_empty_name: bool,
+        load_body: bool,
     ) -> PyResult<Self> {
         let opts = LoadOptions {
             multi_thread: multi_threaded,
@@ -359,25 +400,68 @@ impl Waveform {
         let header_result = viewers::read_header_from_file(path.as_str(), &opts).toerr()?;
         let hier = Hierarchy(Arc::new(header_result.hierarchy));
 
-        let body = viewers::read_body(header_result.body, &hier.0, None)
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        let (wave_source, time_table, body_continuation) = if load_body {
+            let body = viewers::read_body(header_result.body, &hier.0, None)
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+            (Some(body.source), Some(TimeTable(Arc::new(body.time_table))), None)
+        } else {
+            // Store the body continuation for later use
+            (None, None, Some(Box::new(header_result.body)))
+        };
 
         Ok(Self {
             hierarchy: hier,
-            wave_source: body.source,
-            time_table: TimeTable(Arc::new(body.time_table)),
+            wave_source,
+            time_table,
+            body_continuation
         })
     }
+    
+    /// Load the waveform body if not already loaded
+    fn load_body(&mut self) -> PyResult<()> {
+        if self.wave_source.is_some() {
+            return Ok(()); // Already loaded
+        }
+        
+        // Take the body continuation (can only be used once)
+        let body_continuation = self.body_continuation.take()
+            .ok_or_else(|| PyRuntimeError::new_err("Body continuation already consumed or not available"))?;
+        
+        let body = viewers::read_body(*body_continuation, &self.hierarchy.0, None)
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        
+        self.wave_source = Some(body.source);
+        self.time_table = Some(TimeTable(Arc::new(body.time_table)));
+        Ok(())
+    }
+    
+    /// Check if the body has been loaded
+    fn body_loaded(&self) -> bool {
+        self.wave_source.is_some()
+    }
+    
+    /// Get the time table (returns None if body not loaded)
+    #[getter]
+    fn time_table(&self) -> Option<TimeTable> {
+        self.time_table.clone()
+    }
     fn get_signal<'py>(&mut self, var: &Var, py: Python<'py>) -> PyResult<Bound<'py, Signal>> {
-        let mut signal =
-            self.wave_source
-                .load_signals(&[var.0.signal_ref()], &self.hierarchy.0, true);
+        // Ensure body is loaded
+        self.load_body()?;
+        
+        let wave_source = self.wave_source.as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Wave source not available"))?;
+        let time_table = self.time_table.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Time table not available"))?;
+            
+        let mut signal = wave_source
+            .load_signals(&[var.0.signal_ref()], &self.hierarchy.0, true);
         let (_sr, sig) = signal.swap_remove(0);
         Bound::new(
             py,
             Signal {
                 signal: Arc::new(sig),
-                all_times: self.time_table.clone(),
+                all_times: time_table.clone(),
             },
         )
     }
@@ -405,6 +489,100 @@ impl Waveform {
         let var = &self.hierarchy.0[maybe_var];
         self.get_signal(&Var(var.clone()), py)
     }
+
+    /// Load multiple signals at once
+    fn load_signals<'py>(
+        &mut self,
+        vars: Vec<PyRef<'py, Var>>,
+        py: Python<'py>,
+    ) -> PyResult<Vec<Bound<'py, Signal>>> {
+        // Ensure body is loaded
+        self.load_body()?;
+        
+        let wave_source = self.wave_source.as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Wave source not available"))?;
+        let time_table = self.time_table.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Time table not available"))?;
+            
+        let signal_refs: Vec<SignalRef> = vars.iter().map(|var| var.0.signal_ref()).collect();
+        let signals = wave_source
+            .load_signals(&signal_refs, &self.hierarchy.0, false);
+
+        let mut result = Vec::new();
+        for (_sr, sig) in signals {
+            let signal = Bound::new(
+                py,
+                Signal {
+                    signal: Arc::new(sig),
+                    all_times: time_table.clone(),
+                },
+            )?;
+            result.push(signal);
+        }
+        Ok(result)
+    }
+
+    /// Load multiple signals at once using multiple threads
+    fn load_signals_multithreaded<'py>(
+        &mut self,
+        vars: Vec<PyRef<'py, Var>>,
+        py: Python<'py>,
+    ) -> PyResult<Vec<Bound<'py, Signal>>> {
+        // Ensure body is loaded
+        self.load_body()?;
+        
+        let wave_source = self.wave_source.as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Wave source not available"))?;
+        let time_table = self.time_table.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Time table not available"))?;
+            
+        let signal_refs: Vec<SignalRef> = vars.iter().map(|var| var.0.signal_ref()).collect();
+        let signals = wave_source
+            .load_signals(&signal_refs, &self.hierarchy.0, true);
+
+        let mut result = Vec::new();
+        for (_sr, sig) in signals {
+            let signal = Bound::new(
+                py,
+                Signal {
+                    signal: Arc::new(sig),
+                    all_times: time_table.clone(),
+                },
+            )?;
+            result.push(signal);
+        }
+        Ok(result)
+    }
+
+    /// Unload signals from memory
+    fn unload_signals(&mut self, signals: Vec<PyRef<Signal>>) -> PyResult<()> {
+        // In the current implementation, signals are reference counted (Arc)
+        // and will be automatically deallocated when Python drops them.
+        // This method is provided for API compatibility and future optimization.
+        drop(signals);
+        Ok(())
+    }
+}
+
+#[pyclass]
+/// Result of querying a signal at a specific time.
+/// Provides information about the current value and next transition.
+struct QueryResult {
+    /// The value at the requested time
+    #[pyo3(get)]
+    value: Option<Py<PyAny>>,
+    
+    /// The actual time when the value change occurred (at or before query_time)
+    #[pyo3(get)]
+    actual_time: Option<wellen::Time>,
+    
+    /// Time table index of the next signal change, if any
+    #[pyo3(get)]
+    next_idx: Option<TimeTableIdx>,
+    
+    /// Timestamp of the next signal change, if any
+    #[pyo3(get)]
+    next_time: Option<wellen::Time>,
 }
 
 #[pyclass]
@@ -436,20 +614,9 @@ impl Signal {
             .get_offset(idx)
             .map(|data_offset| self.signal.get_value_at(&data_offset, 0));
         if let Some(signal) = maybe_signal {
-            let output = match signal {
-                SignalValue::Real(inner) => Some(inner.into_pyobject(py).unwrap().into_any()),
-                SignalValue::String(str) => Some(str.into_pyobject(py).unwrap().into_any()),
-                _ => match BigUint::try_from_signal(signal) {
-                    // If this signal is 2bits, this function will return an int
-                    Some(number) => Some(number.into_pyobject(py).unwrap().into_any()),
-                    // if this signal is not 2bits (e.g. it contains z,x, etc) then this function
-                    // will return a string
-                    None => signal
-                        .to_bit_string()
-                        .map(|val| val.into_pyobject(py).unwrap().into_any()),
-                },
-            };
-            output
+            convert_signal_value_to_py(signal, py)
+                .ok()
+                .map(|py_val| py_val.into_bound(py))
         } else {
             None
         }
@@ -460,6 +627,126 @@ impl Signal {
             signal: self.clone(),
             offset: 0,
         }
+    }
+    
+    /// Get an iterator over all signal changes after a specific time.
+    ///
+    /// Args:
+    ///     start_time: Time after which to return changes
+    ///
+    /// Returns:
+    ///     Iterator yielding tuples of (time, value) for each signal change after start_time
+    pub fn all_changes_after(&self, start_time: wellen::Time) -> SignalChangeIter {
+        // Find the first change after start_time
+        let time_indices = &self.signal.time_indices();
+        
+        // Binary search in the time table to find where to start
+        let start_idx = match self.all_times.0.binary_search(&start_time) {
+            Ok(idx) => {
+                // Exact match - start from the next change
+                // Find the corresponding offset in time_indices
+                let time_table_idx = idx as TimeTableIdx;
+                time_indices.iter().position(|&t| t > time_table_idx).unwrap_or(time_indices.len())
+            },
+            Err(idx) => {
+                // Not exact match - idx is the insertion point
+                let time_table_idx = idx as TimeTableIdx;
+                time_indices.iter().position(|&t| t >= time_table_idx).unwrap_or(time_indices.len())
+            }
+        };
+        
+        SignalChangeIter {
+            signal: self.clone(),
+            offset: start_idx,
+        }
+    }
+    
+    /// Query signal value and transition information at a specific time.
+    /// This is useful for GUI rendering to detect transitions between pixels.
+    ///
+    /// Args:
+    ///     query_time: Time to query the signal at
+    ///
+    /// Returns:
+    ///     QueryResult containing value and transition information
+    pub fn query_signal<'a>(&self, query_time: wellen::Time, py: Python<'a>) -> PyResult<Bound<'a, QueryResult>> {
+        // Binary search to find the time index
+        let time_idx = match self.all_times.0.as_ref().binary_search(&query_time) {
+            Ok(idx) => idx as TimeTableIdx,          // Exact match
+            Err(idx) => {
+                if idx == 0 {
+                    // Query time is before first timestamp
+                    0
+                } else {
+                    (idx - 1) as TimeTableIdx // Get the index before
+                }
+            }
+        };
+
+        // Get the signal offset at this time index (for value at or before query time)
+        let offset = self.signal.get_offset(time_idx);
+        
+        let (value, actual_time) = if let Some(ref data_offset) = offset {
+            // Get the time when this value was actually set
+            let offset_time_idx = self.signal.get_time_idx_at(data_offset);
+            let actual_time = self.all_times.0.get(offset_time_idx as usize).cloned();
+            
+            // Get the signal value (last value in the time step)
+            let signal_value = self.signal.get_value_at(data_offset, data_offset.elements - 1);
+            let value = convert_signal_value_to_py(signal_value, py)?;
+            
+            (Some(value), actual_time)
+        } else {
+            // No change at or before the requested time
+            (None, None)
+        };
+        
+        // Find the next transition
+        let (next_idx, next_time) = if let Some(offset) = offset {
+            // Check if there's a next index from this offset
+            if let Some(next_index) = offset.next_index {
+                let next_idx = next_index.get() as TimeTableIdx;
+                let next_time = self.all_times.0.get(next_idx as usize).cloned();
+                (Some(next_idx), next_time)
+            } else {
+                (None, None)
+            }
+        } else {
+            // If no offset at time_idx, check if there's a first change after this time
+            if let Some(first_idx) = self.signal.get_first_time_idx() {
+                if first_idx > time_idx {
+                    let next_time = self.all_times.0.get(first_idx as usize).cloned();
+                    (Some(first_idx), next_time)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        };
+        
+        Bound::new(
+            py,
+            QueryResult {
+                value,
+                actual_time,
+                next_idx,
+                next_time,
+            },
+        )
+    }
+    
+    /// Check if two Signal objects reference the same underlying wellen::Signal
+    fn __eq__(&self, other: &Signal) -> bool {
+        // Two signals are equal if they have the same signal reference
+        self.signal.signal_ref() == other.signal.signal_ref()
+    }
+    
+    /// Compute hash based on the signal reference
+    fn __hash__(&self) -> u64 {
+        // Use the signal reference index as hash
+        let signal_ref = self.signal.signal_ref();
+        signal_ref.index() as u64
     }
 }
 
@@ -475,6 +762,12 @@ impl SignalChangeIter {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
+    
+    fn __len__(&self) -> usize {
+        let total_changes = self.signal.signal.time_indices().len();
+        total_changes.saturating_sub(self.offset)
+    }
+    
     fn __next__<'a>(
         mut slf: PyRefMut<'_, Self>,
         python: Python<'a>,
