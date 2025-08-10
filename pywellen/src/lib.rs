@@ -32,6 +32,7 @@ fn pywellen(_py: Python, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Timescale>()?;
     m.add_class::<TimescaleUnit>()?;
     m.add_class::<QueryResult>()?;
+    m.add_class::<TimeTable>()?;
     Ok(())
 }
 
