@@ -24,6 +24,7 @@ impl<T> PyErrExt<T> for wellen::Result<T> {
 #[pymodule]
 fn pywellen(_py: Python, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Var>()?;
+    m.add_class::<VarIndex>()?;
     m.add_class::<VarIter>()?;
     m.add_class::<Waveform>()?;
     m.add_class::<Signal>()?;
@@ -183,6 +184,19 @@ impl ScopeIter {
 }
 
 #[pyclass]
+struct VarIndex(pub(crate) wellen::VarIndex);
+
+#[pymethods]
+impl VarIndex {
+    pub fn msb(&self) -> i64 {
+        self.0.msb()
+    }
+    pub fn lsb(&self) -> i64 {
+        self.0.lsb()
+    }
+}
+
+#[pyclass]
 struct Var(pub(crate) wellen::Var);
 
 #[pymethods]
@@ -232,6 +246,10 @@ impl Var {
     }
     pub fn is_1bit(&self) -> bool {
         self.0.is_1bit()
+    }
+    
+    pub fn index(&self) -> Option<VarIndex> {
+        self.0.index().map(VarIndex)
     }
     
     /// Get the signal reference as an integer for internal use
