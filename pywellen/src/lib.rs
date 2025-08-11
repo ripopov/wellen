@@ -446,8 +446,13 @@ impl Waveform {
         let body_continuation = self.body_continuation.take()
             .ok_or_else(|| PyRuntimeError::new_err("Body continuation already consumed or not available"))?;
         
-        let body = viewers::read_body(*body_continuation, &self.hierarchy.0, None)
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        // Release GIL while reading body (heavy I/O operation)
+        let hierarchy = &self.hierarchy.0;
+        let body = Python::with_gil(|py| {
+            py.allow_threads(|| {
+                viewers::read_body(*body_continuation, hierarchy, None)
+            })
+        }).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
         
         self.wave_source = Some(body.source);
         self.time_table = Some(TimeTable(Arc::new(body.time_table)));
@@ -472,9 +477,14 @@ impl Waveform {
             .ok_or_else(|| PyRuntimeError::new_err("Wave source not available"))?;
         let time_table = self.time_table.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Time table not available"))?;
-            
-        let mut signal = wave_source
-            .load_signals(&[var.0.signal_ref()], &self.hierarchy.0, true);
+        
+        // Release GIL while loading signal (heavy I/O operation)
+        let signal_ref = var.0.signal_ref();
+        let hierarchy = &self.hierarchy.0;
+        let mut signal = py.allow_threads(|| {
+            wave_source.load_signals(&[signal_ref], hierarchy, true)
+        });
+        
         let (_sr, sig) = signal.swap_remove(0);
         Bound::new(
             py,
@@ -524,8 +534,12 @@ impl Waveform {
             .ok_or_else(|| PyRuntimeError::new_err("Time table not available"))?;
             
         let signal_refs: Vec<SignalRef> = vars.iter().map(|var| var.0.signal_ref()).collect();
-        let signals = wave_source
-            .load_signals(&signal_refs, &self.hierarchy.0, false);
+        
+        // Release GIL while loading signals (heavy I/O operation)
+        let hierarchy = &self.hierarchy.0;
+        let signals = py.allow_threads(|| {
+            wave_source.load_signals(&signal_refs, hierarchy, false)
+        });
 
         let mut result = Vec::new();
         for (_sr, sig) in signals {
@@ -556,8 +570,12 @@ impl Waveform {
             .ok_or_else(|| PyRuntimeError::new_err("Time table not available"))?;
             
         let signal_refs: Vec<SignalRef> = vars.iter().map(|var| var.0.signal_ref()).collect();
-        let signals = wave_source
-            .load_signals(&signal_refs, &self.hierarchy.0, true);
+        
+        // Release GIL while loading signals with multiple threads (heavy I/O operation)
+        let hierarchy = &self.hierarchy.0;
+        let signals = py.allow_threads(|| {
+            wave_source.load_signals(&signal_refs, hierarchy, true)
+        });
 
         let mut result = Vec::new();
         for (_sr, sig) in signals {
