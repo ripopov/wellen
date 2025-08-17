@@ -519,11 +519,12 @@ impl Waveform {
         self.get_signal(&Var(var.clone()), py)
     }
 
-    /// Load multiple signals at once
-    fn load_signals<'py>(
+    /// Helper function to load signals and preserve input order
+    fn load_signals_impl<'py>(
         &mut self,
         vars: Vec<PyRef<'py, Var>>,
         py: Python<'py>,
+        multithreaded: bool,
     ) -> PyResult<Vec<Bound<'py, Signal>>> {
         // Ensure body is loaded
         self.load_body()?;
@@ -538,21 +539,41 @@ impl Waveform {
         // Release GIL while loading signals (heavy I/O operation)
         let hierarchy = &self.hierarchy.0;
         let signals = py.allow_threads(|| {
-            wave_source.load_signals(&signal_refs, hierarchy, false)
+            wave_source.load_signals(&signal_refs, hierarchy, multithreaded)
         });
 
+        // Build a map from SignalRef to Signal for quick lookup
+        // This ensures we return signals in the same order as requested
+        let mut signal_map: std::collections::HashMap<SignalRef, _> = signals.into_iter().collect();
+        
+        // Return signals in the same order as the input vars
         let mut result = Vec::new();
-        for (_sr, sig) in signals {
-            let signal = Bound::new(
-                py,
-                Signal {
-                    signal: Arc::new(sig),
-                    all_times: time_table.clone(),
-                },
-            )?;
-            result.push(signal);
+        for var in vars.iter() {
+            let signal_ref = var.0.signal_ref();
+            if let Some(sig) = signal_map.remove(&signal_ref) {
+                let signal = Bound::new(
+                    py,
+                    Signal {
+                        signal: Arc::new(sig),
+                        all_times: time_table.clone(),
+                    },
+                )?;
+                result.push(signal);
+            } else {
+                // If signal not found, return an error
+                return Err(PyRuntimeError::new_err("Signal not found for variable"));
+            }
         }
         Ok(result)
+    }
+
+    /// Load multiple signals at once
+    fn load_signals<'py>(
+        &mut self,
+        vars: Vec<PyRef<'py, Var>>,
+        py: Python<'py>,
+    ) -> PyResult<Vec<Bound<'py, Signal>>> {
+        self.load_signals_impl(vars, py, false)
     }
 
     /// Load multiple signals at once using multiple threads
@@ -561,34 +582,7 @@ impl Waveform {
         vars: Vec<PyRef<'py, Var>>,
         py: Python<'py>,
     ) -> PyResult<Vec<Bound<'py, Signal>>> {
-        // Ensure body is loaded
-        self.load_body()?;
-        
-        let wave_source = self.wave_source.as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("Wave source not available"))?;
-        let time_table = self.time_table.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Time table not available"))?;
-            
-        let signal_refs: Vec<SignalRef> = vars.iter().map(|var| var.0.signal_ref()).collect();
-        
-        // Release GIL while loading signals with multiple threads (heavy I/O operation)
-        let hierarchy = &self.hierarchy.0;
-        let signals = py.allow_threads(|| {
-            wave_source.load_signals(&signal_refs, hierarchy, true)
-        });
-
-        let mut result = Vec::new();
-        for (_sr, sig) in signals {
-            let signal = Bound::new(
-                py,
-                Signal {
-                    signal: Arc::new(sig),
-                    all_times: time_table.clone(),
-                },
-            )?;
-            result.push(signal);
-        }
-        Ok(result)
+        self.load_signals_impl(vars, py, true)
     }
 
     /// Unload signals from memory
