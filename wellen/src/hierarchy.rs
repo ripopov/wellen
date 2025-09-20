@@ -351,6 +351,11 @@ impl Var {
     pub fn var_type(&self) -> VarType {
         self.var_tpe
     }
+
+    /// Returns the parent scope reference if this variable has a parent.
+    pub fn parent(&self, _hierarchy: &Hierarchy) -> Option<ScopeRef> {
+        self.parent
+    }
     pub fn enum_type<'a>(
         &self,
         hierarchy: &'a Hierarchy,
@@ -474,6 +479,11 @@ impl Scope {
 
     pub fn scope_type(&self) -> ScopeType {
         self.tpe
+    }
+
+    /// Returns the parent scope reference if this scope has a parent.
+    pub fn parent(&self, _hierarchy: &Hierarchy) -> Option<ScopeRef> {
+        self.parent
     }
 
     pub fn source_loc<'a>(&self, hierarchy: &'a Hierarchy) -> Option<(&'a str, u64)> {
