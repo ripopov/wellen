@@ -783,6 +783,12 @@ impl Hierarchy {
         Some(self[var_id].var_type())
     }
 
+    /// Get the first variable reference that points to the given signal.
+    /// Returns None if no variable points to this signal.
+    pub fn get_var_by_signal_ref(&self, signal_idx: SignalRef) -> Option<VarRef> {
+        *self.signal_idx_to_var.get(signal_idx.index())?
+    }
+
     pub fn get_slice_info(&self, signal_idx: SignalRef) -> Option<SignalSlice> {
         self.slices.get(&signal_idx).copied()
     }
